@@ -195,7 +195,6 @@ The full topology adds API and Nginx nodes, streaming replicas, and a three-memb
 * If ports are busy, change the relevant values in `.env`.
 * HTTP 429 responses during load tests indicate expected load shedding; investigate 5xx responses and timeouts instead.
 
----
 
 ## Author
 
