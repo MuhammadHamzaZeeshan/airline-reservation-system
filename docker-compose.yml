@@ -1,0 +1,108 @@
+# FULL (HA) stack = lite + 3rd API node, 2nd Nginx, 2nd outbox worker, streaming replicas for both Citus workers and the coordinator,
+# and a 3-member MongoDB replica set. Use:  make up-full && make init-db-ha
+name: ars
+
+include:
+  - docker-compose.lite.yml
+
+x-replica: &replica
+  build: {context: ., dockerfile: docker/citus/Dockerfile}
+  image: ars-citus:local
+  restart: unless-stopped
+  entrypoint: ["/replica-entrypoint.sh"]
+  environment: &replica-env
+    POSTGRES_USER: ${POSTGRES_USER}
+    POSTGRES_DB: ${POSTGRES_DB}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    POSTGRES_HOST_AUTH_METHOD: trust
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+    interval: 5s
+    timeout: 3s
+    retries: 60
+  networks: [ars]
+
+services:
+  worker1-replica:
+    <<: *replica
+    container_name: ars-worker1-replica
+    environment: {<<: *replica-env, PRIMARY_HOST: worker1}
+    volumes: [worker1-replica-data:/var/lib/postgresql/data]
+  worker2-replica:
+    <<: *replica
+    container_name: ars-worker2-replica
+    environment: {<<: *replica-env, PRIMARY_HOST: worker2}
+    volumes: [worker2-replica-data:/var/lib/postgresql/data]
+  coordinator-standby:
+    <<: *replica
+    container_name: ars-coordinator-standby
+    environment: {<<: *replica-env, PRIMARY_HOST: coordinator}
+    volumes: [coordinator-standby-data:/var/lib/postgresql/data]
+
+  mongo2:
+    image: mongo:7
+    container_name: ars-mongo2
+    restart: unless-stopped
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"]
+    volumes: [mongo2-data:/data/db]
+    networks: [ars]
+  mongo3:
+    image: mongo:7
+    container_name: ars-mongo3
+    restart: unless-stopped
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"]
+    volumes: [mongo3-data:/data/db]
+    networks: [ars]
+
+  api3:
+    build: {context: ., dockerfile: app/Dockerfile}
+    image: ars-app:local
+    container_name: ars-api3
+    restart: unless-stopped
+    env_file: .env
+    environment: {NODE_NAME: api3}
+    depends_on:
+      pgbouncer: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health/live', timeout=2).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks: [ars]
+
+  outbox-worker2:
+    build: {context: ., dockerfile: app/Dockerfile}
+    image: ars-app:local
+    container_name: ars-outbox-worker2
+    restart: unless-stopped
+    env_file: .env
+    command: ["python", "-m", "workers.outbox_worker"]
+    depends_on:
+      pgbouncer: {condition: service_healthy}
+    networks: [ars]
+
+  nginx2:
+    build: {context: ., dockerfile: docker/nginx/Dockerfile}
+    image: ars-edge:local
+    container_name: ars-nginx2
+    restart: unless-stopped
+    ports: ["127.0.0.1:${HTTP_PORT_2}:80"]
+    volumes: ["./nginx/nginx.full.conf:/etc/nginx/nginx.conf:ro"]
+    depends_on:
+      api1: {condition: service_healthy}
+      api2: {condition: service_healthy}
+      api3: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/nginx-health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [ars]
+
+volumes:
+  worker1-replica-data:
+  worker2-replica-data:
+  coordinator-standby-data:
+  mongo2-data:
+  mongo3-data:

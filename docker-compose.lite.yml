@@ -1,0 +1,248 @@
+# LITE stack: fits in 16 GB RAM. 1 Citus coordinator + 2 workers, PgBouncer, Redis, MongoDB (1-node replica set), Neo4j, ClickHouse,
+# 2 API nodes, 3 background workers, Nginx (serves the React app + load-balances the API), Prometheus, Grafana, k6 and the simulation
+# controller. Citus nodes use trust auth INSIDE the private compose network only; no worker port is published.
+name: ars
+
+x-citus: &citus
+  build: {context: ., dockerfile: docker/citus/Dockerfile}
+  image: ars-citus:local
+  restart: unless-stopped
+  environment: &citus-env
+    POSTGRES_DB: ${POSTGRES_DB}
+    POSTGRES_USER: ${POSTGRES_USER}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    POSTGRES_HOST_AUTH_METHOD: trust
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+    interval: 5s
+    timeout: 3s
+    retries: 30
+  networks: [ars]
+
+x-app: &app
+  build: {context: ., dockerfile: app/Dockerfile}
+  image: ars-app:local
+  restart: unless-stopped
+  env_file: .env
+  networks: [ars]
+
+x-api: &api
+  <<: *app
+  depends_on:
+    pgbouncer: {condition: service_healthy}
+    redis: {condition: service_healthy}
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health/live', timeout=2).status==200 else 1)"]
+    interval: 5s
+    timeout: 3s
+    retries: 12
+
+x-worker: &worker
+  <<: *app
+  depends_on:
+    pgbouncer: {condition: service_healthy}
+    redis: {condition: service_healthy}
+
+services:
+  coordinator:
+    <<: *citus
+    container_name: ars-coordinator
+    ports: ["127.0.0.1:${PG_PUBLIC_PORT}:5432"]
+    volumes: [coordinator-data:/var/lib/postgresql/data]
+    depends_on:
+      worker1: {condition: service_healthy}
+      worker2: {condition: service_healthy}
+
+  worker1:
+    <<: *citus
+    container_name: ars-worker1
+    volumes: [worker1-data:/var/lib/postgresql/data]
+
+  worker2:
+    <<: *citus
+    container_name: ars-worker2
+    volumes: [worker2-data:/var/lib/postgresql/data]
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: ars-pgbouncer
+    restart: unless-stopped
+    environment:
+      DB_HOST: coordinator
+      DB_PORT: "5432"
+      DB_USER: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_NAME: ${POSTGRES_DB}
+      POOL_MODE: transaction
+      AUTH_TYPE: scram-sha-256
+      MAX_CLIENT_CONN: "3000"
+      DEFAULT_POOL_SIZE: "40"
+      RESERVE_POOL_SIZE: "10"
+      SERVER_RESET_QUERY: DISCARD ALL
+      IGNORE_STARTUP_PARAMETERS: extra_float_digits
+    depends_on:
+      coordinator: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [ars]
+
+  redis:
+    # redis-stack-server ships RedisBloom (BF.*) for the O(1) username pre-check. AOF keeps Bloom/holds across restarts.
+    image: redis/redis-stack-server:7.2.0-v10
+    container_name: ars-redis
+    restart: unless-stopped
+    environment: {REDIS_ARGS: "--appendonly yes"}
+    ports: ["127.0.0.1:${REDIS_PUBLIC_PORT}:6379"]
+    volumes: [redis-data:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [ars]
+
+  mongo:
+    image: mongo:7
+    container_name: ars-mongo
+    restart: unless-stopped
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.5"]
+    environment: {MONGO_RS_MEMBERS: "${MONGO_RS_MEMBERS:-mongo:27017}"}
+    volumes: [mongo-data:/data/db]
+    healthcheck:
+      # the first successful probe also initiates the replica set (idempotent)
+      test: ["CMD", "mongosh", "--quiet", "--eval", "try{rs.status().ok}catch(e){const m=(process.env.MONGO_RS_MEMBERS||'mongo:27017').split(',').map((h,i)=>({_id:i,host:h}));rs.initiate({_id:'rs0',members:m}).ok}"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+    networks: [ars]
+
+  neo4j:
+    image: neo4j:5.24-community
+    container_name: ars-neo4j
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD}
+      NEO4J_server_memory_heap_initial__size: 256m
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 256m
+    volumes: [neo4j-data:/data]
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p ${NEO4J_PASSWORD} 'RETURN 1' >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 8s
+      retries: 30
+    networks: [ars]
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: ars-clickhouse
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: ars
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ulimits: {nofile: {soft: 262144, hard: 262144}}
+    volumes: [clickhouse-data:/var/lib/clickhouse]
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [ars]
+
+  api1:
+    <<: *api
+    container_name: ars-api1
+    environment: {NODE_NAME: api1}
+  api2:
+    <<: *api
+    container_name: ars-api2
+    environment: {NODE_NAME: api2}
+
+  outbox-worker:
+    <<: *worker
+    container_name: ars-outbox-worker
+    command: ["python", "-m", "workers.outbox_worker"]
+  hold-reconciler:
+    <<: *worker
+    container_name: ars-hold-reconciler
+    command: ["python", "-m", "workers.hold_reconciler"]
+  graph-loader:
+    <<: *worker
+    container_name: ars-graph-loader
+    command: ["python", "-m", "workers.graph_loader"]
+
+  nginx:
+    build: {context: ., dockerfile: docker/nginx/Dockerfile}
+    image: ars-edge:local
+    container_name: ars-nginx
+    restart: unless-stopped
+    ports: ["127.0.0.1:${HTTP_PORT}:80"]
+    volumes: ["./nginx/nginx.conf:/etc/nginx/nginx.conf:ro"]
+    depends_on:
+      api1: {condition: service_healthy}
+      api2: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/nginx-health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [ars]
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: ars-prometheus
+    restart: unless-stopped
+    ports: ["127.0.0.1:${PROMETHEUS_PORT}:9090"]
+    volumes: ["./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    networks: [ars]
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: ars-grafana
+    restart: unless-stopped
+    ports: ["127.0.0.1:${GRAFANA_PORT}:3000"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on: [prometheus]
+    networks: [ars]
+
+  k6:
+    # idle container; the admin panel / Makefile run `docker exec ars-k6 k6 run ...`
+    image: grafana/k6:0.54.0
+    container_name: ars-k6
+    restart: unless-stopped
+    entrypoint: ["sleep", "infinity"]
+    environment: {BASE_URL: "http://nginx:80"}
+    volumes: ["./loadtest/k6:/scripts:ro"]
+    networks: [ars]
+
+  simctl:
+    build: {context: docker/simctl}
+    image: ars-simctl:local
+    container_name: ars-simctl
+    restart: unless-stopped
+    environment: {SIMCTL_TOKEN: "${SIMCTL_TOKEN}", EDGE_URL: "http://nginx:80"}
+    volumes: ["/var/run/docker.sock:/var/run/docker.sock"]
+    networks: [ars]
+
+networks:
+  ars:
+
+volumes:
+  coordinator-data:
+  worker1-data:
+  worker2-data:
+  redis-data:
+  mongo-data:
+  neo4j-data:
+  clickhouse-data:
