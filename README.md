@@ -195,6 +195,14 @@ The full topology adds API and Nginx nodes, streaming replicas, and a three-memb
 * If ports are busy, change the relevant values in `.env`.
 * HTTP 429 responses during load tests indicate expected load shedding; investigate 5xx responses and timeouts instead.
 
-## Academic Project
+---
 
-Developed for **BSCS-606: Distributed Database Systems** as a practical study of distributed transactions, sharding, consistency, polyglot persistence, observability, and fault tolerance.
+## Author
+
+**Muhammad Hamza Zeeshan**  
+BSCS – University of Karachi  
+hamzazeeshan675@gmail.com
+
+---
+
+⭐ *Star this repo if you found it helpful or want to contribute!*
